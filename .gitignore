@@ -1,0 +1,10 @@
+# Konfigurasi lokal
+server/config/server.env
+admin/config/admin.env
+
+# Data runtime
+server/data/
+server/run/
+admin/run/
+
+.DS_Store

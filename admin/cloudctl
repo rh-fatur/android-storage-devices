@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# cloudctl (ADMIN) - dijalankan di HP admin (Termux). Juga jalan di Linux/macOS/WSL.
+# Mengendalikan HP cloud lewat SSH. Tidak ada layanan cloud yang jalan di sini.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ADMIN_DIR="$(dirname "$SELF")"
+SERVER_SRC="$(dirname "$ADMIN_DIR")/server"
+CONF="$ADMIN_DIR/config/admin.env"
+RUN_DIR="$ADMIN_DIR/run"
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_conf() {
+  [ -f "$CONF" ] || die "Belum dikonfigurasi. Jalankan: cloud init"
+  # shellcheck disable=SC1090
+  . "$CONF"
+  SSH_PORT="${SSH_PORT:-8022}"
+  SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_cloud}"
+  REMOTE_DIR="${REMOTE_DIR:-cloud-server}"
+  REMOTE_ROOT="${REMOTE_ROOT:-storage/shared/CloudStorage}"
+  [ -n "${CLOUD_HOST:-}" ] && [ -n "${CLOUD_USER:-}" ] || die "CLOUD_HOST/CLOUD_USER kosong di $CONF"
+  TARGET="$CLOUD_USER@$CLOUD_HOST"
+
+  COMMON=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new)
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;  # ControlMaster tidak didukung di Windows
+    *) mkdir -p "$HOME/.ssh"
+       COMMON+=(-o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$HOME/.ssh/cm-cloud-%C") ;;
+  esac
+}
+
+# Jalankan 'cloudctl <args>' milik server di HP cloud.
+rc()     { ssh "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "bash \"\$HOME/$REMOTE_DIR/cloudctl\" $(printf '%q ' "$@")"; }
+rc_tty() { ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "bash \"\$HOME/$REMOTE_DIR/cloudctl\" $(printf '%q ' "$@")"; }
+
+tcp_ok() { # tcp_ok <host> <port>
+  if have timeout; then timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+  else bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; fi
+}
+
+cmd_init() {
+  local host user port key a
+  if [ -f "$CONF" ]; then read -r -p "admin.env sudah ada. Timpa? [y/N] " a; [ "$a" = y ] || exit 0; fi
+  read -r -p "IP HP cloud (lihat 'cloudctl status' di sana): " host
+  read -r -p "Username Termux HP cloud (jalankan 'whoami' di sana): " user
+  read -r -p "Port SSH [8022]: " port; port="${port:-8022}"
+  key="$HOME/.ssh/id_ed25519_cloud"
+
+  mkdir -p "$HOME/.ssh"
+  [ -f "$key" ] || ssh-keygen -t ed25519 -f "$key" -N "" -C "cloud-admin@$(uname -n)"
+
+  echo "Memasang kunci publik di HP cloud (masukkan password SSH Termux-nya sekali)..."
+  ssh -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" \
+    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && cat >> ~/.ssh/authorized_keys' < "$key.pub"
+
+  sed -e "s|^CLOUD_HOST=.*|CLOUD_HOST=$host|" \
+      -e "s|^CLOUD_USER=.*|CLOUD_USER=$user|" \
+      -e "s|^SSH_PORT=.*|SSH_PORT=$port|" \
+      "$ADMIN_DIR/config/admin.env.example" > "$CONF"
+
+  load_conf
+  ssh "${COMMON[@]}" -o BatchMode=yes -p "$SSH_PORT" "$TARGET" 'echo "Login dengan kunci: OK"'
+  echo "Selesai. Berikutnya: cloud setup"
+}
+
+cmd_deploy() {
+  [ -x "$SERVER_SRC/cloudctl" ] || die "Folder server/ tidak ditemukan di $SERVER_SRC"
+  echo "Mengirim server/ ke $TARGET:~/$REMOTE_DIR ..."
+  COPYFILE_DISABLE=1 tar -C "$SERVER_SRC" -cf - cloudctl boot config/server.env.example \
+    | ssh "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" \
+        "mkdir -p \"\$HOME/$REMOTE_DIR\" && tar -C \"\$HOME/$REMOTE_DIR\" -xf - && chmod +x \"\$HOME/$REMOTE_DIR/cloudctl\" \"\$HOME/$REMOTE_DIR/boot/start-cloud.sh\""
+  echo "Deploy selesai (config/server.env & data di HP cloud tidak disentuh)."
+}
+
+cmd_status() {
+  tcp_ok "$CLOUD_HOST" "$SSH_PORT" || die "HP cloud tidak terjangkau di $CLOUD_HOST:$SSH_PORT (mati, offline, atau IP berubah)."
+  rc status
+}
+
+# Folder unduhan bawaan di HP admin (terlihat di aplikasi File/Galeri)
+default_dl() { if [ -d "$HOME/storage/downloads" ]; then echo "$HOME/storage/downloads"; else echo "."; fi; }
+
+cmd_ls()   { ssh "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "ls -lAh -- \"\$HOME/$REMOTE_ROOT/\"$(printf '%q' "${1:-}")"; }
+cmd_pull() { [ $# -ge 1 ] || die "Pemakaian: pull <path-di-cloud> [folder-lokal]"
+  local dest="${2:-$(default_dl)}"
+  scp -r "${COMMON[@]}" -P "$SSH_PORT" "$TARGET:$REMOTE_ROOT/$1" "$dest"
+  echo "Tersimpan di: $dest"; }
+cmd_push() { [ $# -ge 1 ] || die "Pemakaian: push <file/folder-lokal> [folder-tujuan-di-cloud]"
+  scp -r "${COMMON[@]}" -P "$SSH_PORT" "$1" "$TARGET:$REMOTE_ROOT/${2:-}"; }
+
+# ---------- monitor: notifikasi Android bila HP cloud mati ----------
+notify() { # notify <judul> <isi>
+  echo "$(date '+%F %T') $1: $2"
+  if have termux-notification; then
+    termux-notification --id cloud-status --title "$1" --content "$2" --priority high 2>/dev/null || true
+  fi
+}
+
+monitor_loop() {
+  local interval="$1" state="" now
+  have termux-wake-lock && termux-wake-lock || true
+  while true; do
+    if tcp_ok "$CLOUD_HOST" "$SSH_PORT"; then now=up; else now=down; fi
+    if [ "$now" != "$state" ]; then
+      case "$now" in
+        up)   [ -n "$state" ] && notify "HP cloud kembali online" "SSH di $CLOUD_HOST menjawab lagi." ;;
+        down) notify "HP cloud tidak terjangkau" "Mati, offline, sshd berhenti, atau IP berubah ($CLOUD_HOST)." ;;
+      esac
+      state="$now"
+    fi
+    sleep "$interval"
+  done
+}
+
+cmd_monitor() {
+  local pidf="$RUN_DIR/monitor.pid" logf="$RUN_DIR/monitor.log" interval=60
+  mkdir -p "$RUN_DIR"
+  case "${1:-}" in
+    --stop)
+      if [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null; then echo "Monitor dihentikan."; else echo "Monitor tidak berjalan."; fi
+      rm -f "$pidf"; return ;;
+    --bg)
+      if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then echo "Monitor sudah berjalan (PID $(cat "$pidf"))."; return; fi
+      nohup bash "$SELF" monitor "${2:-60}" >> "$logf" 2>&1 < /dev/null &
+      echo $! > "$pidf"
+      echo "Monitor berjalan di latar belakang (PID $!). Log: $logf"; return ;;
+    [0-9]*) interval="$1" ;;
+  esac
+  echo "Memantau $CLOUD_HOST tiap ${interval} dtk. Berhenti dengan Ctrl+C."
+  monitor_loop "$interval"
+}
+
+cmd_help() {
+  cat <<'H'
+cloud (admin) - kendalikan HP cloud dari HP admin
+
+Pertama kali:
+  init                 buat kunci SSH, hubungkan ke HP cloud, simpan konfigurasi
+  setup                kirim skrip + instal openssh di HP cloud
+
+Mengatur HP cloud:
+  start | stop | restart | status
+  logs [-f]            log watchdog
+  boot-install         pasang auto-start di HP cloud
+  ssh-harden           matikan login password SSH (setelah init berhasil)
+  config               edit config/server.env di HP cloud (nano)
+  deploy               kirim ulang skrip server/ (setelah update repo)
+  shell                SSH interaktif ke HP cloud
+
+File:
+  ls [folder]          daftar isi folder cloud
+  push <lokal> [dir]   salin dari HP admin ke cloud
+  pull <path> [lokal]  salin dari cloud ke HP admin (default: Downloads)
+
+Pemantauan:
+  monitor [dtk]        pantau HP cloud, notifikasi jika mati
+  monitor --bg [dtk]   di latar belakang  |  monitor --stop
+H
+}
+
+main() {
+  local c="${1:-help}"; [ $# -gt 0 ] && shift
+  case "$c" in
+    help|-h|--help) cmd_help; return ;;
+    init)           cmd_init; return ;;
+  esac
+  load_conf
+  case "$c" in
+    deploy)   cmd_deploy ;;
+    setup)    cmd_deploy; rc_tty setup ;;
+    status)   cmd_status ;;
+    logs)     case " $* " in *" -f "*) rc_tty logs "$@" ;; *) rc logs "$@" ;; esac ;;
+    stop)     echo "Peringatan: sshd HP cloud akan berhenti; nyalakan lagi langsung dari HP cloud."
+              rc stop ;;
+    start|restart|boot-install|ssh-harden) rc "$c" ;;
+    config)   ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "nano \"\$HOME/$REMOTE_DIR/config/server.env\"" ;;
+    shell)    ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" ;;
+    ls)       cmd_ls "$@" ;;
+    pull)     cmd_pull "$@" ;;
+    push)     cmd_push "$@" ;;
+    monitor)  cmd_monitor "$@" ;;
+    *)        cmd_help; exit 1 ;;
+  esac
+}
+main "$@"
